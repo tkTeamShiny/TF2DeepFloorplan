@@ -11,6 +11,25 @@ os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 
 # print('Is gpu available: ',tf.test.is_gpu_available());
 
+def make_const_kernel_initializer(kernel_2d_or_4d):
+    """
+    Keras 3 の initializer 仕様に合わせて、要求 shape=(kh, kw, in_ch, out_ch) にタイルする初期化関数を返す。
+    - kernel_2d_or_4d: (kh, kw) or (kh, kw, 1, 1) など
+    """
+    k = tf.convert_to_tensor(kernel_2d_or_4d, dtype=tf.float32)
+    if k.shape.rank == 2:
+        k = tf.reshape(k, (k.shape[0], k.shape[1], 1, 1))  # (kh, kw, 1, 1)
+
+    def _init(shape, dtype=None):
+        kh, kw, in_ch, out_ch = shape
+        base = tf.image.resize(  # kh,kw が一致する前提ならそのままでもよい
+            tf.reshape(k, (k.shape[0], k.shape[1], 1, 1)),
+            (kh, kw),
+            method="nearest")
+        base = tf.tile(base, [1, 1, in_ch, out_ch])  # (kh, kw, in_ch, out_ch)
+        return tf.cast(base, dtype or tf.float32)
+
+    return _init
 
 def conv2d(
     dim: int,
@@ -110,18 +129,20 @@ class deepfloorplanModel(Model):
         dak = [9, 17, 33, 65]  # kernel_shape=[h,v,inc,outc]
         # horizontal
         self.hs = [self.constant_kernel((d, 1, 1, 1)) for d in dak]
-        self.hf = [
-            tf.keras.layers.Conv2D(
-                1,
-                [dak[i], 1],
-                strides=1,
-                padding="same",
-                trainable=False,
-                use_bias=False,
-                weights=[self.hs[i]],
+        # 変更後（Keras 3 対応）
+        self.hf = []
+        for i, d in enumerate(dak):
+            self.hf.append(
+                tf.keras.layers.Conv2D(
+                    filters=1,
+                    kernel_size=(d, 1),
+                    use_bias=False,
+                    padding="same",
+                    kernel_initializer=make_const_kernel_initializer(self.hs[i]),
+                    trainable=False,
+                    name=f"hf_{i}",
+                )
             )
-            for i in range(len(dak))
-        ]
         # vertical
         self.vs = [self.constant_kernel((1, d, 1, 1)) for d in dak]
         self.vf = [
