@@ -13,8 +13,8 @@ os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 
 def make_const_kernel_initializer(kernel_2d_or_4d):
     """
-    (kh, kw) or (kh, kw, 1, 1) のカーネルを、ビルド時の shape=(kh,kw,in_ch,out_ch)
-    にタイルして返す Initializer。
+    (kh, kw) or (kh, kw, 1, 1) のカーネルを、要求 shape=(kh,kw,in_ch,out_ch) に
+    タイルして返す Initializer（Keras 3 対応）。
     """
     k = tf.convert_to_tensor(kernel_2d_or_4d, dtype=tf.float32)
     if k.shape.rank == 2:  # (kh, kw) -> (kh, kw, 1, 1)
@@ -23,10 +23,9 @@ def make_const_kernel_initializer(kernel_2d_or_4d):
     def _init(shape, dtype=None):
         kh, kw, in_ch, out_ch = shape
         base = tf.reshape(k, (k.shape[0], k.shape[1], 1, 1))
-        # kh,kw が一致しない設計でなければ resize 不要。念のため nearest で合わせる:
         if base.shape[0] != kh or base.shape[1] != kw:
             base = tf.image.resize(base, (kh, kw), method="nearest")
-        base = tf.tile(base, [1, 1, in_ch, out_ch])
+        base = tf.tile(base, [1, 1, in_ch, out_ch])  # (kh,kw,in_ch,out_ch)
         return tf.cast(base, dtype or tf.float32)
 
     return _init
@@ -159,20 +158,20 @@ class deepfloorplanModel(Model):
                     name=f"vf_{i}",
                 )
             )
-        # diagonal
         self.ds = [self.constant_kernel((d, d, 1, 1), diag=True) for d in dak]
-        self.df = [
-            tf.keras.layers.Conv2D(
-                1,
-                dak[i],
-                strides=1,
-                padding="same",
-                trainable=False,
-                use_bias=False,
-                weights=[self.ds[i]],
+        self.df = []
+        for i, d in enumerate(dak):
+            self.df.append(
+                tf.keras.layers.Conv2D(
+                    filters=1,
+                    kernel_size=(d, d) if isinstance(d, int) else tuple(d),
+                    use_bias=False,
+                    padding="same",
+                    kernel_initializer=make_const_kernel_initializer(self.ds[i]),
+                    trainable=False,
+                    name=f"df_{i}",
+                )
             )
-            for i in range(len(dak))
-        ]
         # diagonal flip
         self.dfs = [
             self.constant_kernel((d, d, 1, 1), diag=True, flip=True)
