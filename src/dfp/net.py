@@ -13,20 +13,20 @@ os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 
 def make_const_kernel_initializer(kernel_2d_or_4d):
     """
-    Keras 3 の initializer 仕様に合わせて、要求 shape=(kh, kw, in_ch, out_ch) にタイルする初期化関数を返す。
-    - kernel_2d_or_4d: (kh, kw) or (kh, kw, 1, 1) など
+    (kh, kw) or (kh, kw, 1, 1) のカーネルを、ビルド時の shape=(kh,kw,in_ch,out_ch)
+    にタイルして返す Initializer。
     """
     k = tf.convert_to_tensor(kernel_2d_or_4d, dtype=tf.float32)
-    if k.shape.rank == 2:
-        k = tf.reshape(k, (k.shape[0], k.shape[1], 1, 1))  # (kh, kw, 1, 1)
+    if k.shape.rank == 2:  # (kh, kw) -> (kh, kw, 1, 1)
+        k = tf.reshape(k, (k.shape[0], k.shape[1], 1, 1))
 
     def _init(shape, dtype=None):
         kh, kw, in_ch, out_ch = shape
-        base = tf.image.resize(  # kh,kw が一致する前提ならそのままでもよい
-            tf.reshape(k, (k.shape[0], k.shape[1], 1, 1)),
-            (kh, kw),
-            method="nearest")
-        base = tf.tile(base, [1, 1, in_ch, out_ch])  # (kh, kw, in_ch, out_ch)
+        base = tf.reshape(k, (k.shape[0], k.shape[1], 1, 1))
+        # kh,kw が一致しない設計でなければ resize 不要。念のため nearest で合わせる:
+        if base.shape[0] != kh or base.shape[1] != kw:
+            base = tf.image.resize(base, (kh, kw), method="nearest")
+        base = tf.tile(base, [1, 1, in_ch, out_ch])
         return tf.cast(base, dtype or tf.float32)
 
     return _init
@@ -145,18 +145,20 @@ class deepfloorplanModel(Model):
             )
         # vertical
         self.vs = [self.constant_kernel((1, d, 1, 1)) for d in dak]
-        self.vf = [
-            tf.keras.layers.Conv2D(
-                1,
-                [1, dak[i]],
-                strides=1,
-                padding="same",
-                trainable=False,
-                use_bias=False,
-                weights=[self.vs[i]],
+        # 変更後（OK）
+        self.vf = []
+        for i, d in enumerate(dak):
+            self.vf.append(
+                tf.keras.layers.Conv2D(
+                    filters=1,
+                    kernel_size=(1, d),
+                    use_bias=False,
+                    padding="same",
+                    kernel_initializer=make_const_kernel_initializer(self.vs[i]),
+                    trainable=False,
+                    name=f"vf_{i}",
+                )
             )
-            for i in range(len(dak))
-        ]
         # diagonal
         self.ds = [self.constant_kernel((d, d, 1, 1), diag=True) for d in dak]
         self.df = [
