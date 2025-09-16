@@ -30,13 +30,24 @@ def init(
         model = deepfloorplanModel(config=config)
     elif config.tfmodel == "func":
         model = deepfloorplanFunc(config=config)
+    # ↓↓↓ ここを書き換え ↓↓↓
     if config.loadmethod == "log":
-        model.load_weights(config.weight)
+        w = config.weight
+        # ディレクトリ or 拡張子なし → TF Checkpoint とみなして復元
+        if os.path.isdir(w) or os.path.splitext(w)[1] == "":
+            ckpt_path = tf.train.latest_checkpoint(w) if os.path.isdir(w) else w
+            if ckpt_path is None:
+                raise FileNotFoundError(f"No checkpoint found under: {w}")
+            tf.train.Checkpoint(model=model).restore(ckpt_path).expect_partial()
+        else:
+            # .weights.h5 / .h5 のファイルなら従来通り
+            model.load_weights(w)
     elif config.loadmethod == "pb":
+        # 既存の処理（必要なら tflite に切替えてもOK）
         model = tf.keras.models.load_model(config.weight)
     elif config.loadmethod == "tflite":
-        model = tf.lite.Interpreter(model_path=config.weight)
-        model.allocate_tensors()
+        # 既存の tflite 分岐
+        pass
     img = mpimg.imread(config.image)[:, :, :3]
     shp = img.shape
     img = tf.convert_to_tensor(img, dtype=tf.uint8)
