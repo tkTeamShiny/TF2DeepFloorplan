@@ -11,23 +11,21 @@ os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
 
 # print('Is gpu available: ',tf.test.is_gpu_available());
 
+import tensorflow as tf
+import numpy as np
+
 def make_const_kernel_initializer(kernel_2d_or_4d):
-    """
-    (kh, kw) or (kh, kw, 1, 1) のカーネルを、要求 shape=(kh,kw,in_ch,out_ch) に
-    タイルして返す Initializer（Keras 3 対応）。
-    """
+    """(kh,kw) もしくは (kh,kw,1,1) のカーネルを (kh,kw,in_ch,out_ch) にタイルして返す。"""
     k = tf.convert_to_tensor(kernel_2d_or_4d, dtype=tf.float32)
     if k.shape.rank == 2:  # (kh, kw) -> (kh, kw, 1, 1)
         k = tf.reshape(k, (k.shape[0], k.shape[1], 1, 1))
-
     def _init(shape, dtype=None):
         kh, kw, in_ch, out_ch = shape
         base = tf.reshape(k, (k.shape[0], k.shape[1], 1, 1))
         if base.shape[0] != kh or base.shape[1] != kw:
             base = tf.image.resize(base, (kh, kw), method="nearest")
-        base = tf.tile(base, [1, 1, in_ch, out_ch])  # (kh,kw,in_ch,out_ch)
+        base = tf.tile(base, [1, 1, in_ch, out_ch])
         return tf.cast(base, dtype or tf.float32)
-
     return _init
 
 def conv2d(
@@ -177,18 +175,21 @@ class deepfloorplanModel(Model):
             self.constant_kernel((d, d, 1, 1), diag=True, flip=True)
             for d in dak
         ]
-        self.dff = [
-            tf.keras.layers.Conv2D(
-                1,
-                dak[i],
-                strides=1,
-                padding="same",
-                trainable=False,
-                use_bias=False,
-                weights=[self.dfs[i]],
+        self.dff = []
+        for i, d in enumerate(dak):
+            self.dff.append(
+                tf.keras.layers.Conv2D(
+                    filters=1,
+                    kernel_size=(d, d) if isinstance(d, int) else tuple(d),
+                    use_bias=False,
+                    padding="same",
+                    # ★ ここ：元々 weights=[・・・] に渡していた “同じカーネル変数” をそのまま渡す
+                    kernel_initializer=make_const_kernel_initializer(self.dfs[i]),
+                    trainable=False,
+                    name=f"dff_{i}",
+                )
             )
-            for i in range(len(dak))
-        ]
+
         # expand dim
         self.ed = [conv2d(dim=d, size=1, act="linear") for d in dimlist]
         # learn rich feature
