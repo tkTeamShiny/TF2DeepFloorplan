@@ -2,7 +2,7 @@ import argparse
 import gc
 import os
 import sys
-from typing import List, Tuple
+from typing import Tuple, List, Union, Dict, Any
 
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
@@ -63,50 +63,63 @@ def init(
         model.vgg16.trainable = False
     return model, img, shp
 
+def predict(model: tf.keras.Model,
+            img: tf.Tensor,
+            shp: Any) -> Tuple[tf.Tensor, tf.Tensor]:
+    """
+    Run inference with a Keras 3 model (subclass) without iterating layers manually.
 
-def predict(
-    model: tf.keras.Model, img: tf.Tensor, shp: np.ndarray
-) -> Tuple[tf.Tensor, tf.Tensor]:
-    features = []
-    feature = img
-    for layer in model.vgg16.layers:
-        feature = layer(feature)
-        if layer.name.find("pool") != -1:
-            features.append(feature)
-    x = feature
-    features = features[::-1]
-    del model.vgg16
-    gc.collect()
+    Notes
+    -----
+    * Keras 3 では InputLayer を layer(x) のように直接呼ぶと TypeError になるため、
+      逐次ループではなく model(img, training=False) を使う。
+    * 本リポジトリの `main()` 実装では、`--loadmethod log` のとき
+        logits_cw, logits_r = predict(...)
+      と受け取る一方、`--loadmethod pb/none` のときは
+        logits_r, logits_cw = model(img)
+      という順序になる。
+      そのためここでは「モデルの生の出力（通常は (logits_r, logits_cw) ）」を受け取り、
+      `(logits_cw, logits_r)` の順に並べ替えて返す。
+    """
+    # ---- 推論を一発で実行（Keras 3 互換）----
+    outputs: Union[Tuple[tf.Tensor, tf.Tensor], List[tf.Tensor], Dict[str, tf.Tensor], tf.Tensor]
+    outputs = model(img, training=False)
 
-    featuresrbp = []
-    for i in range(len(model.rbpups)):
-        x = model.rbpups[i](x) + model.rbpcv1[i](features[i + 1])
-        x = model.rbpcv2[i](x)
-        featuresrbp.append(x)
-    logits_cw = tf.keras.backend.resize_images(
-        model.rbpfinal(x), 2, 2, "channels_last"
-    )
+    logits_r: tf.Tensor = None
+    logits_cw: tf.Tensor = None
 
-    x = features.pop(0)
-    nLays = len(model.rtpups)
-    for i in range(nLays):
-        rs = model.rtpups.pop(0)
-        r1 = model.rtpcv1.pop(0)
-        r2 = model.rtpcv2.pop(0)
-        f = features.pop(0)
-        x = rs(x) + r1(f)
-        x = r2(x)
-        a = featuresrbp.pop(0)
-        x = model.non_local_context(a, x, i)
+    # 代表的な3パターンに対応
+    if isinstance(outputs, (tuple, list)):
+        if len(outputs) != 2:
+            raise TypeError(f"Unexpected number of outputs: {len(outputs)} (expected 2).")
+        # 既存コードの pb/none 分岐に合わせ、(r, cw) を想定
+        logits_r, logits_cw = outputs[0], outputs[1]
+    elif isinstance(outputs, dict):
+        # キー名は環境により異なる可能性があるため候補を広めに見る
+        # room/rooms/rt 等 → room タスクのロジット
+        # cw/boundary/edges 等 → corner+wall（境界）タスクのロジット
+        room_keys = ("room", "rooms", "rt", "logits_r", "room_logits")
+        cw_keys   = ("cw", "boundary", "boundaries", "edges", "logits_cw", "cw_logits")
+        for k in room_keys:
+            if k in outputs:
+                logits_r = outputs[k]
+                break
+        for k in cw_keys:
+            if k in outputs:
+                logits_cw = outputs[k]
+                break
+        if logits_r is None or logits_cw is None:
+            raise KeyError(
+                f"Cannot find expected keys in model outputs. Got keys: {list(outputs.keys())}"
+            )
+    else:
+        # 単一テンソルが返る場合は本実装の前提に合わない
+        raise TypeError(
+            "Model returned a single tensor; expected a tuple/list/dict of two tensors (room, cw)."
+        )
 
-    del featuresrbp
-    logits_r = tf.keras.backend.resize_images(
-        model.rtpfinal(x), 2, 2, "channels_last"
-    )
-    del model.rtpfinal
-
+    # ---- 返却順（log 分岐の期待）に合わせる： (cw, r) ----
     return logits_cw, logits_r
-
 
 def post_process(
     rm_ind: np.ndarray, bd_ind: np.ndarray, shp: np.ndarray
