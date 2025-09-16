@@ -260,6 +260,58 @@ def deploy_plot_res(result: np.ndarray):
     plt.yticks([])
     plt.grid(False)
 
+def _assert_and_fix_order(logits_a, logits_b):
+    """
+    2つのテンソルから (logits_cw[... ,3], logits_r[... ,9]) の順で返す。
+    どちらがどちらか不明でも自動判定する。
+    """
+    def _last(t):
+        s = tuple(t.shape)
+        return s[-1] if len(s) >= 3 else None
+
+    ca, cb = _last(logits_a), _last(logits_b)
+    # 期待：cw=3, r=9
+    if (ca, cb) == (3, 9):
+        return logits_a, logits_b
+    if (ca, cb) == (9, 3):
+        return logits_b, logits_a
+
+    # どちらかが 3 か 9 なら判別
+    if ca == 3:  # a が cw
+        return logits_a, logits_b
+    if cb == 3:  # b が cw
+        return logits_b, logits_a
+    if ca == 9:  # a が r
+        return logits_b, logits_a
+    if cb == 9:  # b が r
+        return logits_a, logits_b
+
+    raise ValueError(f"Unexpected channel sizes: {ca=}, {cb=}. Expected (3,9) in some order.")
+
+def postprocess_logits(logits_cw, logits_r, thr_cw: float = 0.35):
+    """
+    logits を確率に変換してマップを作る。
+    - cw はマルチラベル境界（3ch）想定 → sigmoid + しきい値
+    - r は相互排他な部屋クラス（9ch）想定 → softmax + argmax
+    返り値:
+      room_map: (H,W) uint8  … 0..8 のクラスID
+      cw_mask:  (H,W,3) uint8 … 各チャネルの0/1マスク
+    """
+    # 形を [H,W,C] に揃える
+    if len(logits_cw.shape) == 4 and logits_cw.shape[0] == 1:
+        logits_cw = logits_cw[0]
+    if len(logits_r.shape) == 4 and logits_r.shape[0] == 1:
+        logits_r = logits_r[0]
+
+    # 確率化
+    cw_prob = tf.sigmoid(logits_cw).numpy()         # (H,W,3)
+    r_prob  = tf.nn.softmax(logits_r, axis=-1).numpy()  # (H,W,9)
+
+    # マップ化
+    cw_mask  = (cw_prob > thr_cw).astype(np.uint8)      # (H,W,3)
+    room_map = np.argmax(r_prob, axis=-1).astype(np.uint8)  # (H,W)
+
+    return room_map, cw_mask
 
 if __name__ == "__main__":
     args = parse_args(sys.argv[1:])
