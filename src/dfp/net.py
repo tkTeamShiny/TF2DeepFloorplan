@@ -251,35 +251,67 @@ class deepfloorplanModel(Model):
         out = self.lrf[idx](features)
         return out
 
-    def call(self, x, training: bool = False):
+    def call(self, x: tf.Tensor, training: bool = False) -> Tuple[tf.Tensor, tf.Tensor]:
         """
-        Keras 3 互換の安全版。
-        VGG16 の各 layer を for で回さず、クラス内のビルダー関数で
-        エンコーダ／デコーダを実行して logits を返します。
+        Keras 3 互換の forward 実装（完全版）。
+        - VGG16 の InputLayer は callable ではないためスキップ
+        - その他の層は training 引数の有無に応じて安全に呼び出し
+        - 特徴マップの回収は self.feature_names（未設定なら 'pool' 名）に従う
+        - 以降の RBP/ RTP の処理は元実装と同一
+        戻り値: (logits_r, logits_cw)
         """
-        # 1) Encoder（VGG16ベースの特徴抽出）
-        #    build_f_net が training 引数を取らない実装でも動くように try でフォールバック
-        try:
-            pools = self.build_f_net(x, training=training)
-        except TypeError:
-            pools = self.build_f_net(x)
+        features = []
+        feature = x
     
-        # 2) Room Boundary デコーダ
-        try:
-            cw = self.build_cw_net(pools, training=training)
-        except TypeError:
-            cw = self.build_cw_net(pools)
+        # ====== VGG16 エンコーダ（InputLayer を呼ばない）======
+        for layer in self.vgg16.layers:
+            # Keras 3: InputLayer は layer(feature) できないのでスキップ
+            if isinstance(layer, tf.keras.layers.InputLayer):
+                continue
     
-        # 3) Room Types デコーダ（Boundary のコンテキストを使用）
-        try:
-            up16_cw, up16_r = self.build_r_net(pools, cw, training=training)
-        except TypeError:
-            up16_cw, up16_r = self.build_r_net(pools, cw)
+            # 一部の層（例: BatchNorm）は training を受け取る。
+            # 受け取らない層もあるため try/except で安全に呼ぶ。
+            try:
+                feature = layer(feature, training=training)
+            except TypeError:
+                feature = layer(feature)
     
-        # 4) ロジットを 512x512 にバイリニアアップ
-        #    （本家既定： boundary=3ch, room=9ch）
-        logits_cw = _up_bilinear(up16_cw, dim=3,  shape=(512, 512), name="logits_cw")
-        logits_r  = _up_bilinear(up16_r,  dim=9,  shape=(512, 512), name="logits_r")
+            # 特徴マップの回収
+            name = getattr(layer, "name", "")
+            if hasattr(self, "feature_names") and isinstance(self.feature_names, (list, tuple)) and self.feature_names:
+                if name in self.feature_names:
+                    features.append(feature)
+            else:
+                # feature_names が未設定の場合のフォールバック
+                if "pool" in name:
+                    features.append(feature)
     
-        # 返却順は既存コードに合わせて（deploy.py では (logits_r, logits_cw) or 逆の分岐がある点に注意）
+        # VGG の最終出力も保持（元実装準拠）
+        x = feature
+        # features は高次解像度側が先になるよう反転（元実装準拠）
+        features = features[::-1]
+    
+        # ====== Room Boundary Prediction (RBP) パス ======
+        featuresrbp = []
+        for i in range(len(self.rbpups)):
+            # upsample + skip
+            x = self.rbpups[i](x) + self.rbpcv1[i](features[i + 1])
+            x = self.rbpcv2[i](x)
+            featuresrbp.append(x)
+    
+        # 512x512 にアップサンプリング（元実装は K.backend.resize_images を使用）
+        logits_cw = tf.keras.backend.resize_images(self.rbpfinal(x), 2, 2, "channels_last")
+    
+        # ====== Room Types Prediction (RTP) パス ======
+        # 元実装ではここで x を VGG の最終 feature に戻す
+        x = feature
+        for i in range(len(self.rtpups)):
+            x = self.rtpups[i](x) + self.rtpcv1[i](features[i + 1])
+            x = self.rtpcv2[i](x)
+            # RBP の文脈を注入（Non-local Context）
+            x = self.non_local_context(featuresrbp[i], x, i)
+    
+        logits_r = tf.keras.backend.resize_images(self.rtpfinal(x), 2, 2, "channels_last")
+    
+        # 戻り順は元実装どおり (logits_r, logits_cw)
         return logits_r, logits_cw
