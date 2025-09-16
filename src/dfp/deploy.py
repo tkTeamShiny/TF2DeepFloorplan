@@ -63,62 +63,39 @@ def init(
         model.vgg16.trainable = False
     return model, img, shp
 
-def predict(model: tf.keras.Model,
-            img: tf.Tensor,
-            shp: Any) -> Tuple[tf.Tensor, tf.Tensor]:
+def predict(model, img, shp):
     """
-    Run inference with a Keras 3 model (subclass) without iterating layers manually.
-
-    Notes
-    -----
-    * Keras 3 では InputLayer を layer(x) のように直接呼ぶと TypeError になるため、
-      逐次ループではなく model(img, training=False) を使う。
-    * 本リポジトリの `main()` 実装では、`--loadmethod log` のとき
-        logits_cw, logits_r = predict(...)
-      と受け取る一方、`--loadmethod pb/none` のときは
-        logits_r, logits_cw = model(img)
-      という順序になる。
-      そのためここでは「モデルの生の出力（通常は (logits_r, logits_cw) ）」を受け取り、
-      `(logits_cw, logits_r)` の順に並べ替えて返す。
+    Keras3互換：model(img, training=False) を呼ぶだけ。
+    モデルの生出力が (r,cw) / (cw,r) / dict のいずれでも、
+    ここで (cw, r) の順に正規化して返す。
     """
-    # ---- 推論を一発で実行（Keras 3 互換）----
     outputs: Union[Tuple[tf.Tensor, tf.Tensor], List[tf.Tensor], Dict[str, tf.Tensor], tf.Tensor]
     outputs = model(img, training=False)
 
-    logits_r: tf.Tensor = None
-    logits_cw: tf.Tensor = None
-
-    # 代表的な3パターンに対応
     if isinstance(outputs, (tuple, list)):
-        if len(outputs) != 2:
-            raise TypeError(f"Unexpected number of outputs: {len(outputs)} (expected 2).")
-        # 既存コードの pb/none 分岐に合わせ、(r, cw) を想定
-        logits_r, logits_cw = outputs[0], outputs[1]
+        a, b = outputs[0], outputs[1]
     elif isinstance(outputs, dict):
-        # キー名は環境により異なる可能性があるため候補を広めに見る
-        # room/rooms/rt 等 → room タスクのロジット
-        # cw/boundary/edges 等 → corner+wall（境界）タスクのロジット
+        # 辞書キー名のゆらぎに対応
         room_keys = ("room", "rooms", "rt", "logits_r", "room_logits")
         cw_keys   = ("cw", "boundary", "boundaries", "edges", "logits_cw", "cw_logits")
-        for k in room_keys:
-            if k in outputs:
-                logits_r = outputs[k]
-                break
+        a = None; b = None
         for k in cw_keys:
-            if k in outputs:
-                logits_cw = outputs[k]
-                break
-        if logits_r is None or logits_cw is None:
-            raise KeyError(
-                f"Cannot find expected keys in model outputs. Got keys: {list(outputs.keys())}"
-            )
+            if k in outputs: a = outputs[k]; break
+        for k in room_keys:
+            if k in outputs: b = outputs[k]; break
+        if a is None or b is None:
+            # 逆順の可能性
+            for k in room_keys:
+                if k in outputs: a = outputs[k]; break
+            for k in cw_keys:
+                if k in outputs: b = outputs[k]; break
+        if a is None or b is None:
+            raise KeyError(f"predict(): cannot resolve outputs from keys={list(outputs.keys())}")
     else:
-        # 単一テンソルが返る場合は本実装の前提に合わない
-        raise TypeError(
-            "Model returned a single tensor; expected a tuple/list/dict of two tensors (room, cw)."
-        )
+        raise TypeError("Model returned a single tensor; expected 2 outputs (room & cw).")
 
-    # ---- 返却順（log 分岐の期待）に合わせる： (cw, r) ----
+    # ここで (cw, r) に正規化
+    logits_cw, logits_r = _assert_and_fix_order(a, b)
     return logits_cw, logits_r
 
 def post_process(
@@ -177,6 +154,26 @@ def main(config: argparse.Namespace) -> np.ndarray:
                 logits_cw, logits_r = predict(model, img, shp)
             elif config.loadmethod == "pb" or config.loadmethod == "none":
                 logits_r, logits_cw = model(img)
+    # =========================
+    # 2) 出力順の正規化 (必須)
+    #    ここが「どこに入れるか」の答え：↑で logits を得た “直後”
+    # =========================
+    if config.loadmethod == "tflite":
+        # TFLite 分岐では logits_a/logits_b を (cw, r) に直す
+        logits_cw, logits_r = _assert_and_fix_order(logits_a, logits_b)
+    elif config.loadmethod == "pb" or config.loadmethod == "none":
+        # pb/none は (r, cw) になっている可能性が高いので逆順で渡す
+        logits_cw, logits_r = _assert_and_fix_order(logits_r, logits_cw)
+    else:
+        # log 分岐で predict() が (cw, r) を返す前提だが、保険で正規化
+        logits_cw, logits_r = _assert_and_fix_order(logits_cw, logits_r)
+
+    # =========================
+    # 3) 後処理（確率化→マップ化）
+    #    ★ ここを追加するのが Step.3
+    # =========================
+    room_map, cw_mask = postprocess_logits(logits_cw, logits_r, thr_cw=0.35)
+    
     logits_r = tf.image.resize(logits_r, shp[:2])
     logits_cw = tf.image.resize(logits_cw, shp[:2])
     r = convert_one_hot_to_image(logits_r)[0].numpy()
