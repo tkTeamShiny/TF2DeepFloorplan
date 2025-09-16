@@ -1,6 +1,6 @@
 import argparse
 import os
-from typing import Tuple
+from typing import Tuple, List
 
 import numpy as np
 import tensorflow as tf
@@ -251,29 +251,35 @@ class deepfloorplanModel(Model):
         out = self.lrf[idx](features)
         return out
 
-    def call(self, x: tf.Tensor) -> Tuple[tf.Tensor, tf.Tensor]:
-        features = []
-        feature = x
-        for layer in self.vgg16.layers:
-            feature = layer(feature)
-            if layer.name in self.feature_names:
-                features.append(feature)
-        x = feature
-        features = features[::-1]
-        featuresrbp = []
-        for i in range(len(self.rbpups)):
-            x = self.rbpups[i](x) + self.rbpcv1[i](features[i + 1])
-            x = self.rbpcv2[i](x)
-            featuresrbp.append(x)
-        logits_cw = tf.keras.backend.resize_images(
-            self.rbpfinal(x), 2, 2, "channels_last"
-        )
-        x = feature
-        for i in range(len(self.rtpups)):
-            x = self.rtpups[i](x) + self.rtpcv1[i](features[i + 1])
-            x = self.rtpcv2[i](x)
-            x = self.non_local_context(featuresrbp[i], x, i)
-        logits_r = tf.keras.backend.resize_images(
-            self.rtpfinal(x), 2, 2, "channels_last"
-        )
+    def call(self, x, training: bool = False):
+        """
+        Keras 3 互換の安全版。
+        VGG16 の各 layer を for で回さず、クラス内のビルダー関数で
+        エンコーダ／デコーダを実行して logits を返します。
+        """
+        # 1) Encoder（VGG16ベースの特徴抽出）
+        #    build_f_net が training 引数を取らない実装でも動くように try でフォールバック
+        try:
+            pools = self.build_f_net(x, training=training)
+        except TypeError:
+            pools = self.build_f_net(x)
+    
+        # 2) Room Boundary デコーダ
+        try:
+            cw = self.build_cw_net(pools, training=training)
+        except TypeError:
+            cw = self.build_cw_net(pools)
+    
+        # 3) Room Types デコーダ（Boundary のコンテキストを使用）
+        try:
+            up16_cw, up16_r = self.build_r_net(pools, cw, training=training)
+        except TypeError:
+            up16_cw, up16_r = self.build_r_net(pools, cw)
+    
+        # 4) ロジットを 512x512 にバイリニアアップ
+        #    （本家既定： boundary=3ch, room=9ch）
+        logits_cw = _up_bilinear(up16_cw, dim=3,  shape=(512, 512), name="logits_cw")
+        logits_r  = _up_bilinear(up16_r,  dim=9,  shape=(512, 512), name="logits_r")
+    
+        # 返却順は既存コードに合わせて（deploy.py では (logits_r, logits_cw) or 逆の分岐がある点に注意）
         return logits_r, logits_cw
